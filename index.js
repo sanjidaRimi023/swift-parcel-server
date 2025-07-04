@@ -2,7 +2,7 @@ const express = require("express");
 const cors = require("cors");
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 require("dotenv").config();
-
+const stripe = require("stripe")(process.env.VITE_STRIPE_SECRET_KEY);
 const app = express();
 const port = process.env.PORT || 5000;
 
@@ -24,6 +24,7 @@ async function run() {
     await client.connect();
     const db = client.db("swiftParcelDB");
     const parcelsCollection = db.collection("parcels");
+    const paymentCollection = db.collection("payments");
 
     app.get("/", (req, res) => {
       res.send("SwiftParcel server is running!");
@@ -49,10 +50,24 @@ async function run() {
         const id = req.params.id;
         const query = { _id: new ObjectId(id) };
         const result = await parcelsCollection.findOne(query);
-        res.send();
+        res.send(result);
       } catch (error) {
         console.error("Error fetching the parcel:", error);
         res.status(500).send({ message: "Failed to get parcel data" });
+      }
+    });
+
+    app.get("/payments", async (req, res) => {
+      try {
+        const userEmail = req.query.email;
+        const query = userEmail ? { email: userEmail } : {};
+        const option = { sort: { paidAt: -1 } };
+
+        const payments = await paymentCollection.find(query, option).toArray();
+        res.send(payments);
+      } catch (error) {
+        console.log("error in history loading");
+        res.status(500).send({ success: false, error: "data is not loaded" });
       }
     });
 
@@ -60,6 +75,63 @@ async function run() {
       const newParcel = req.body;
       const result = await parcelsCollection.insertOne(newParcel);
       res.send(result);
+    });
+
+    //create payment intent api for payment recieve
+
+    app.post("/create-payment-intent", async (req, res) => {
+      const amountInCent = req.body.amountInCent;
+
+      try {
+        const paymentIntent = await stripe.paymentIntents.create({
+          amount: amountInCent,
+          currency: "usd",
+          automatic_payment_methods: { enabled: true },
+        });
+
+        res.json({ clientSecret: paymentIntent.client_secret });
+      } catch (error) {
+        res.status(500).json({ error: error.message });
+      }
+    });
+
+    //parcels update and save payment history api
+
+    app.post("/payments", async (req, res) => {
+      const { parcelId, userEmail, amount, paymentMethod, transactionId } =
+        req.body;
+
+      try {
+        // 1. parcel update
+        const updateParcels = await parcelsCollection.updateOne(
+          { _id: new ObjectId(parcelId) },
+          { $set: { payment_status: "paid" } }
+        );
+
+        // 2. payment history save
+        const paymentRecord = {
+          parcelId: new ObjectId(parcelId),
+          userEmail,
+          amount,
+          paymentMethod,
+          transactionId,
+          status: "paid",
+          paid_at_string: new Date().toISOString(),
+          paidAt: new Date(),
+        };
+
+        const insertHistory = await paymentCollection.insertOne(paymentRecord);
+
+        res.send({
+          success: true,
+          message: "Payment successful & history saved",
+          updated: updateParcels.modifiedCount > 0,
+          insertedId: insertHistory.insertedId,
+        });
+      } catch (error) {
+        console.error("Problem in saving history:", error);
+        res.status(500).send({ success: false, error: "Server Error" });
+      }
     });
 
     app.delete("/parcels/:id", async (req, res) => {
